@@ -66,7 +66,7 @@ OVERRIDDEN_REQUIREMENTS_ACTIONS = {
     # "flimsy" on 386). The following packages depend on pandas,
     # so we comment them out.
     "wheels_armhf": {
-        "exclude": {"env-canada", "noaa-coops", "pyezviz", "pykrakenapi"},
+        "exclude": {"env-canada", "pyezviz", "pykrakenapi"},
         "include": INCLUDED_REQUIREMENTS_WHEELS,
     },
     "wheels_armv7": {"exclude": set(), "include": INCLUDED_REQUIREMENTS_WHEELS},

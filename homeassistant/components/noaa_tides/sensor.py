@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 import logging
-from typing import TYPE_CHECKING, Any, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
-import noaa_coops as coops
+from dateutil import parser
 import requests
 import voluptuous as vol
 
@@ -16,14 +16,10 @@ from homeassistant.components.sensor import (
 )
 from homeassistant.const import CONF_NAME, CONF_TIME_ZONE, CONF_UNIT_SYSTEM
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import PlatformNotReady
 import homeassistant.helpers.config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 from homeassistant.util.unit_system import METRIC_SYSTEM
-
-if TYPE_CHECKING:
-    from pandas import Timestamp
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -36,6 +32,8 @@ SCAN_INTERVAL = timedelta(minutes=60)
 
 TIMEZONES = ["gmt", "lst", "lst_ldt"]
 UNIT_SYSTEMS = ["english", "metric"]
+
+DATA_GETTER_URL = "https://api.tidesandcurrents.noaa.gov/api/prod/datagetter"
 
 PLATFORM_SCHEMA = SENSOR_PLATFORM_SCHEMA.extend(
     {
@@ -65,21 +63,7 @@ def setup_platform(
     else:
         unit_system = UNIT_SYSTEMS[0]
 
-    try:
-        station = coops.Station(station_id, unit_system)
-    except KeyError:
-        _LOGGER.error("NOAA Tides Sensor station_id %s does not exist", station_id)
-        return
-    except requests.exceptions.ConnectionError as exception:
-        _LOGGER.error(
-            "Connection error during setup in NOAA Tides Sensor for station_id: %s",
-            station_id,
-        )
-        raise PlatformNotReady from exception
-
-    noaa_sensor = NOAATidesAndCurrentsSensor(
-        name, station_id, timezone, unit_system, station
-    )
+    noaa_sensor = NOAATidesAndCurrentsSensor(name, station_id, timezone, unit_system)
 
     add_entities([noaa_sensor], True)
 
@@ -87,9 +71,9 @@ def setup_platform(
 class NOAATidesData(TypedDict):
     """Representation of a single tide."""
 
-    time_stamp: list[Timestamp]
-    hi_lo: list[Literal["L", "H"]]
-    predicted_wl: list[float]
+    time_stamp: datetime
+    hi_lo: Literal["L", "H"]
+    predicted_wl: float
 
 
 class NOAATidesAndCurrentsSensor(SensorEntity):
@@ -97,14 +81,13 @@ class NOAATidesAndCurrentsSensor(SensorEntity):
 
     _attr_attribution = "Data provided by NOAA"
 
-    def __init__(self, name, station_id, timezone, unit_system, station) -> None:
+    def __init__(self, name, station_id, timezone, unit_system) -> None:
         """Initialize the sensor."""
         self._name = name
         self._station_id = station_id
         self._timezone = timezone
         self._unit_system = unit_system
-        self._station = station
-        self.data: NOAATidesData | None = None
+        self.data: list[NOAATidesData] | None = None
 
     @property
     def name(self) -> str:
@@ -117,24 +100,24 @@ class NOAATidesAndCurrentsSensor(SensorEntity):
         attr: dict[str, Any] = {}
         if self.data is None:
             return attr
-        if self.data["hi_lo"][1] == "H":
-            attr["high_tide_time"] = self.data["time_stamp"][1].strftime(
+        if self.data[1]["hi_lo"] == "H":
+            attr["high_tide_time"] = self.data[1]["time_stamp"].strftime(
                 "%Y-%m-%dT%H:%M"
             )
-            attr["high_tide_height"] = self.data["predicted_wl"][1]
-            attr["low_tide_time"] = self.data["time_stamp"][2].strftime(
+            attr["high_tide_height"] = self.data[1]["predicted_wl"]
+            attr["low_tide_time"] = self.data[2]["time_stamp"].strftime(
                 "%Y-%m-%dT%H:%M"
             )
-            attr["low_tide_height"] = self.data["predicted_wl"][2]
-        elif self.data["hi_lo"][1] == "L":
-            attr["low_tide_time"] = self.data["time_stamp"][1].strftime(
+            attr["low_tide_height"] = self.data[2]["predicted_wl"]
+        elif self.data[1]["hi_lo"] == "L":
+            attr["low_tide_time"] = self.data[1]["time_stamp"].strftime(
                 "%Y-%m-%dT%H:%M"
             )
-            attr["low_tide_height"] = self.data["predicted_wl"][1]
-            attr["high_tide_time"] = self.data["time_stamp"][2].strftime(
+            attr["low_tide_height"] = self.data[1]["predicted_wl"]
+            attr["high_tide_time"] = self.data[2]["time_stamp"].strftime(
                 "%Y-%m-%dT%H:%M"
             )
-            attr["high_tide_height"] = self.data["predicted_wl"][2]
+            attr["high_tide_height"] = self.data[2]["predicted_wl"]
         return attr
 
     @property
@@ -142,11 +125,11 @@ class NOAATidesAndCurrentsSensor(SensorEntity):
         """Return the state of the device."""
         if self.data is None:
             return None
-        api_time = self.data["time_stamp"][0]
-        if self.data["hi_lo"][0] == "H":
+        api_time = self.data[0]["time_stamp"]
+        if self.data[0]["hi_lo"] == "H":
             tidetime = api_time.strftime("%-I:%M %p")
             return f"High tide at {tidetime}"
-        if self.data["hi_lo"][0] == "L":
+        if self.data[0]["hi_lo"] == "L":
             tidetime = api_time.strftime("%-I:%M %p")
             return f"Low tide at {tidetime}"
         return None
@@ -157,21 +140,27 @@ class NOAATidesAndCurrentsSensor(SensorEntity):
         delta = timedelta(days=2)
         end = begin + delta
         try:
-            df_predictions = self._station.get_data(
-                begin_date=begin.strftime("%Y%m%d %H:%M"),
-                end_date=end.strftime("%Y%m%d %H:%M"),
-                product="predictions",
-                datum="MLLW",
-                interval="hilo",
-                units=self._unit_system,
-                time_zone=self._timezone,
-            )
-            api_data = df_predictions.head()
-            self.data = NOAATidesData(
-                time_stamp=list(api_data.index),
-                hi_lo=list(api_data["hi_lo"].values),
-                predicted_wl=list(api_data["predicted_wl"].values),
-            )
+            params = {
+                "begin_date": begin.strftime("%Y%m%d %H:%M"),
+                "end_date": end.strftime("%Y%m%d %H:%M"),
+                "product": "predictions",
+                "datum": "MLLW",
+                "interval": "hilo",
+                "units": self._unit_system,
+                "time_zone": self._timezone,
+                "format": "json",
+                "station": self._station_id,
+            }
+            response = requests.get(DATA_GETTER_URL, params=params, timeout=10)
+            api_data = response.json()["predictions"]
+            self.data = [
+                NOAATidesData(
+                    time_stamp=parser.parse(tide_data["t"]),
+                    hi_lo=tide_data["type"],
+                    predicted_wl=tide_data["v"],
+                )
+                for tide_data in api_data
+            ]
             _LOGGER.debug("Data = %s", api_data)
             _LOGGER.debug(
                 "Recent Tide data queried with start time set to %s",
@@ -179,4 +168,7 @@ class NOAATidesAndCurrentsSensor(SensorEntity):
             )
         except ValueError as err:
             _LOGGER.error("Check NOAA Tides and Currents: %s", err.args)
+            self.data = None
+        except requests.exceptions.RequestException as err:
+            _LOGGER.error("Error fetching NOAA Tides and Currents data: %s", err)
             self.data = None
